@@ -5,18 +5,22 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/hashicorp/terraform/helper/pathorcontents"
-	"github.com/hashicorp/terraform/helper/resource"
-	"github.com/hashicorp/terraform/helper/schema"
-	"github.com/hashicorp/terraform/terraform"
-	"github.com/mitchellh/go-homedir"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/pathorcontents"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/terraform"
+	homedir "github.com/mitchellh/go-homedir"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
 	// Import to initialize client auth plugins.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/rest"
@@ -32,7 +36,7 @@ import (
 
 // Provider returns the provider schema to Terraform.
 func Provider() terraform.ResourceProvider {
-	return &schema.Provider{
+	p := &schema.Provider{
 		Schema: map[string]*schema.Schema{
 			"host": {
 				Type:        schema.TypeString,
@@ -52,6 +56,12 @@ func Provider() terraform.ResourceProvider {
 				Default:     tiller_env.DefaultTillerNamespace,
 				Description: "Set an alternative Tiller namespace.",
 			},
+			"init_helm_home": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     true,
+				Description: "Initialize Helm home directory if it is not already initialized, defaults to true.",
+			},
 			"install_tiller": {
 				Type:        schema.TypeBool,
 				Optional:    true,
@@ -61,7 +71,7 @@ func Provider() terraform.ResourceProvider {
 			"tiller_image": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				Default:     "gcr.io/kubernetes-helm/tiller:v2.9.0",
+				Default:     "gcr.io/kubernetes-helm/tiller:v2.14.3",
 				Description: "Tiller image to install.",
 			},
 			"service_account": {
@@ -97,7 +107,7 @@ func Provider() terraform.ResourceProvider {
 				Type:        schema.TypeBool,
 				Optional:    true,
 				DefaultFunc: schema.EnvDefaultFunc(helm_env.PluginDisableEnvVar, "true"),
-				Description: "Disable plugins. Set HELM_NO_PLUGINS=1 to disable plugins.",
+				Description: "Disable plugins. Set HELM_NO_PLUGINS=0 to enable plugins.",
 			},
 			"insecure": {
 				Type:        schema.TypeBool,
@@ -112,19 +122,16 @@ func Provider() terraform.ResourceProvider {
 			"client_key": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				Default:     "$HELM_HOME/key.pem",
 				Description: "PEM-encoded client certificate key for TLS authentication.",
 			},
 			"client_certificate": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				Default:     "$HELM_HOME/cert.pem",
 				Description: "PEM-encoded client certificate for TLS authentication.",
 			},
 			"ca_certificate": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				Default:     "$HELM_HOME/ca.pem",
 				Description: "PEM-encoded root certificates bundle for TLS authentication.",
 			},
 			"kubernetes": {
@@ -139,8 +146,20 @@ func Provider() terraform.ResourceProvider {
 			"helm_release":    resourceRelease(),
 			"helm_repository": resourceRepository(),
 		},
-		ConfigureFunc: providerConfigure,
+		DataSourcesMap: map[string]*schema.Resource{
+			"helm_repository": dataRepository(),
+		},
 	}
+	p.ConfigureFunc = func(d *schema.ResourceData) (interface{}, error) {
+		terraformVersion := p.TerraformVersion
+		if terraformVersion == "" {
+			// Terraform 0.12 introduced this field to the protocol
+			// We can therefore assume that if it's missing it's 0.10 or 0.11
+			terraformVersion = "0.11+compatible"
+		}
+		return providerConfigure(d, terraformVersion)
+	}
+	return p
 }
 
 func kubernetesResource() *schema.Resource {
@@ -216,12 +235,33 @@ func kubernetesResource() *schema.Resource {
 				Optional:    true,
 				Description: "Retrieve config from Kubernetes cluster.",
 			},
+			"load_config_file": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("KUBE_LOAD_CONFIG_FILE", true),
+				Description: "By default the local config (~/.kube/config) is loaded when you use this provider. This option at false disable this behaviour.",
+			},
 		},
 	}
 }
 
-func providerConfigure(d *schema.ResourceData) (interface{}, error) {
-	return NewMeta(d)
+func providerConfigure(d *schema.ResourceData, terraformVersion string) (interface{}, error) {
+	m := &Meta{data: d}
+	m.buildSettings(m.data)
+
+	if err := m.buildTLSConfig(m.data); err != nil {
+		return nil, err
+	}
+
+	if err := m.buildK8sClient(m.data, terraformVersion); err != nil {
+		return nil, err
+	}
+
+	if err := m.initHelmHomeIfNeeded(m.data); err != nil {
+		return nil, err
+	}
+
+	return m, nil
 }
 
 // Meta is the meta information structure for the provider
@@ -239,22 +279,6 @@ type Meta struct {
 	sync.Mutex
 }
 
-// NewMeta will construct a new Meta from the provided ResourceData
-func NewMeta(d *schema.ResourceData) (*Meta, error) {
-	m := &Meta{data: d}
-	m.buildSettings(m.data)
-
-	if err := m.buildTLSConfig(m.data); err != nil {
-		return nil, err
-	}
-
-	if err := m.buildK8sClient(m.data); err != nil {
-		return nil, err
-	}
-
-	return m, nil
-}
-
 func (m *Meta) buildSettings(d *schema.ResourceData) {
 	m.Settings = &helm_env.EnvSettings{
 		Home:            helmpath.Home(d.Get("home").(string)),
@@ -264,7 +288,7 @@ func (m *Meta) buildSettings(d *schema.ResourceData) {
 	}
 }
 
-func (m *Meta) buildK8sClient(d *schema.ResourceData) error {
+func (m *Meta) buildK8sClient(d *schema.ResourceData, terraformVersion string) error {
 	_, hasStatic := d.GetOk("kubernetes")
 
 	c, err := getK8sConfig(d)
@@ -288,7 +312,7 @@ func (m *Meta) buildK8sClient(d *schema.ResourceData) error {
 	}
 
 	// Overriding with static configuration
-	cfg.UserAgent = fmt.Sprintf("HashiCorp/1.0 Terraform/%s", terraform.VersionString())
+	cfg.UserAgent = fmt.Sprintf("HashiCorp/1.0 Terraform/%s", terraformVersion)
 
 	if v, ok := k8sGetOk(d, "host"); ok {
 		cfg.Host = v.(string)
@@ -329,6 +353,12 @@ var k8sPrefix = "kubernetes.0."
 func k8sGetOk(d *schema.ResourceData, key string) (interface{}, bool) {
 	value, ok := d.GetOk(k8sPrefix + key)
 
+	// For boolean attributes the zero value is Ok
+	switch value.(type) {
+	case bool:
+		value, ok = d.GetOkExists(k8sPrefix + key)
+	}
+
 	// fix: DefaultFunc is not being triggerred on TypeList
 	schema := kubernetesResource().Schema[key]
 	if !ok && schema.DefaultFunc != nil {
@@ -354,13 +384,19 @@ func getK8sConfig(d *schema.ResourceData) (clientcmd.ClientConfig, error) {
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	overrides := &clientcmd.ConfigOverrides{}
 
-	if !k8sGet(d, "in_cluster").(bool) {
-		explicitPath, err := homedir.Expand(k8sGet(d, "config_path").(string))
-		if err != nil {
-			return nil, err
+	if !k8sGet(d, "in_cluster").(bool) && k8sGet(d, "load_config_file").(bool) {
+		configPathSplit := strings.Split(k8sGet(d, "config_path").(string), ":")
+		precedence := make([]string, len(configPathSplit))
+		for i, path := range configPathSplit {
+			expanded, err := homedir.Expand(path)
+			if err != nil {
+				debug("Error expanding path %s", err)
+				return nil, err
+			}
+			precedence[i] = expanded
 		}
 
-		rules.ExplicitPath = explicitPath
+		rules.Precedence = precedence
 		rules.DefaultClientConfig = &clientcmd.DefaultClientConfig
 
 		context := k8sGet(d, "config_context").(string)
@@ -392,6 +428,20 @@ func (m *Meta) initialize() error {
 		return err
 	}
 
+	return nil
+}
+
+func (m *Meta) initHelmHomeIfNeeded(d *schema.ResourceData) error {
+	if !d.Get("init_helm_home").(bool) {
+		return nil
+	}
+
+	stableRepositoryURL := "https://kubernetes-charts.storage.googleapis.com"
+	localRepositoryURL := "http://127.0.0.1:8879/charts"
+
+	if err := installer.Initialize(m.Settings.Home, os.Stdout, false, *m.Settings, stableRepositoryURL, localRepositoryURL); err != nil {
+		return fmt.Errorf("error initializing local helm home: %s", err)
+	}
 	return nil
 }
 
@@ -445,7 +495,7 @@ func (m *Meta) waitForTiller(o *installer.Options) error {
 		Timeout: 5 * time.Minute,
 		Refresh: func() (interface{}, string, error) {
 			debug("Waiting for tiller-deploy to become available.")
-			obj, err := m.K8sClient.Extensions().Deployments(o.Namespace).Get(deployment, metav1.GetOptions{})
+			obj, err := m.K8sClient.AppsV1().Deployments(o.Namespace).Get(deployment, metav1.GetOptions{})
 			if err != nil {
 				return obj, "Error", err
 			}
@@ -467,13 +517,20 @@ func (m *Meta) buildTunnel(d *schema.ResourceData) error {
 		return nil
 	}
 
+	// Wait a reasonable time for tiller, even if we didn't deploy it this run
+	o := &installer.Options{}
+	o.Namespace = m.Settings.TillerNamespace
+	if err := m.waitForTiller(o); err != nil {
+		return err
+	}
+
 	var err error
 	m.Tunnel, err = portforwarder.New(m.Settings.TillerNamespace, m.K8sClient, m.K8sConfig)
 	if err != nil {
 		return fmt.Errorf("error creating tunnel: %q", err)
 	}
 
-	m.Settings.TillerHost = fmt.Sprintf("localhost:%d", m.Tunnel.Local)
+	m.Settings.TillerHost = fmt.Sprintf("127.0.0.1:%d", m.Tunnel.Local)
 	debug("Created tunnel using local port: '%d'\n", m.Tunnel.Local)
 	return nil
 }
@@ -484,6 +541,7 @@ func (m *Meta) buildHelmClient() helm.Interface {
 	}
 
 	if m.TLSConfig != nil {
+		debug("Found TLS settings: configuring helm client with TLS")
 		options = append(options, helm.WithTLS(m.TLSConfig))
 	}
 
@@ -491,11 +549,22 @@ func (m *Meta) buildHelmClient() helm.Interface {
 }
 
 func (m *Meta) buildTLSConfig(d *schema.ResourceData) error {
-	keyPEMBlock, err := getContent(d, "client_key", "$HELM_HOME/key.pem")
+	// Don't initialize TLSConfig if TLS is disabled
+	if !d.Get("enable_tls").(bool) {
+		return nil
+	}
+
+	// The default uses the files in the provider configured helm home
+	helmHome := d.Get("home").(string)
+	clientKeyDefault := filepath.Join(helmHome, "key.pem")
+	clientCertDefault := filepath.Join(helmHome, "cert.pem")
+	caCertDefault := filepath.Join(helmHome, "ca.pem")
+
+	keyPEMBlock, err := getContent(d, "client_key", clientKeyDefault)
 	if err != nil {
 		return err
 	}
-	certPEMBlock, err := getContent(d, "client_certificate", "$HELM_HOME/cert.pem")
+	certPEMBlock, err := getContent(d, "client_certificate", clientCertDefault)
 	if err != nil {
 		return err
 	}
@@ -514,7 +583,7 @@ func (m *Meta) buildTLSConfig(d *schema.ResourceData) error {
 
 	cfg.Certificates = []tls.Certificate{cert}
 
-	caPEMBlock, err := getContent(d, "ca_certificate", "$HELM_HOME/ca.pem")
+	caPEMBlock, err := getContent(d, "ca_certificate", caCertDefault)
 	if err != nil {
 		return err
 	}
@@ -531,7 +600,12 @@ func (m *Meta) buildTLSConfig(d *schema.ResourceData) error {
 }
 
 func getContent(d *schema.ResourceData, key, def string) ([]byte, error) {
+	// Check if the key is defined. If not, use the default.
 	filename := d.Get(key).(string)
+	if filename == "" {
+		filename = def
+	}
+	debug("TLS settings: Attempting to read contents of %s from %s", key, filename)
 
 	content, _, err := pathorcontents.Read(filename)
 	if err != nil {

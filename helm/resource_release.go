@@ -3,17 +3,17 @@ package helm
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
 	"google.golang.org/grpc"
 
 	"github.com/ghodss/yaml"
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 	"k8s.io/helm/pkg/chartutil"
 	"k8s.io/helm/pkg/downloader"
 	"k8s.io/helm/pkg/getter"
@@ -48,13 +48,11 @@ func resourceRelease() *schema.Resource {
 			"repository": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				ForceNew:    true,
 				Description: "Repository where to locate the requested chart. If is an URL the chart is installed without installing the repository.",
 			},
 			"chart": {
 				Type:        schema.TypeString,
 				Required:    true,
-				ForceNew:    true,
 				Description: "Chart name to be installed.",
 			},
 			"version": {
@@ -76,16 +74,12 @@ func resourceRelease() *schema.Resource {
 				Type:        schema.TypeList,
 				Optional:    true,
 				Description: "List of values in raw yaml file to pass to helm.",
-				// Suppress changes of this attribute, it's merged to `overrides`
-				DiffSuppressFunc: suppressAnyDiff,
-				Elem:             &schema.Schema{Type: schema.TypeString},
+				Elem:        &schema.Schema{Type: schema.TypeString},
 			},
 			"set": {
 				Type:        schema.TypeSet,
 				Optional:    true,
 				Description: "Custom values to be merge with the values.",
-				// Suppress changes of this attribute, it's merged to `overrides`
-				DiffSuppressFunc: suppressAnyDiff,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"name": {
@@ -102,7 +96,7 @@ func resourceRelease() *schema.Resource {
 			"set_sensitive": {
 				Type:        schema.TypeSet,
 				Optional:    true,
-				Description: "Custom sensitive values to be merge with the values.",
+				Description: "Custom sensitive values to be merged with the values.",
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"name": {
@@ -121,8 +115,6 @@ func resourceRelease() *schema.Resource {
 				Type:        schema.TypeSet,
 				Optional:    true,
 				Description: "Custom string values to be merge with the values.",
-				// Suppress changes of this attribute, it's merged to `overrides`
-				DiffSuppressFunc: suppressAnyDiff,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"name": {
@@ -205,14 +197,14 @@ func resourceRelease() *schema.Resource {
 				Type:        schema.TypeString,
 				Computed:    true,
 				Description: "The result YAML file got by merging all passed `set`, `set_string` and `values`",
-      },
+			},
 			"status": {
 				Type:        schema.TypeString,
 				Computed:    true,
 				Description: "Status of the release.",
 			},
 			"metadata": {
-				Type:        schema.TypeSet,
+				Type:        schema.TypeList,
 				Computed:    true,
 				Description: "Status of the deployed release.",
 				Elem: &schema.Resource{
@@ -252,11 +244,6 @@ func resourceRelease() *schema.Resource {
 			},
 		},
 	}
-}
-
-// suppressAnyDiff could be used to ultimately suppresses the diff of the resource attribute
-func suppressAnyDiff(k, old, new string, d *schema.ResourceData) bool {
-	return true
 }
 
 // prepareTillerForNewRelease determines the current status of the given release and
@@ -314,19 +301,27 @@ func prepareTillerForNewRelease(d *schema.ResourceData, c helm.Interface, name s
 }
 
 func resourceDiff(d *schema.ResourceDiff, meta interface{}) error {
-  // Always set desired state to be DEPLOYED
+	// Always set desired state to DEPLOYED
 	err := d.SetNew("status", release.Status_DEPLOYED.String())
 	if err != nil {
 		return err
 	}
-  
+
 	// Get version from the release metadata
 	c, _, err := getChart(d, meta.(*Meta))
 	if err != nil {
 		return nil
 	}
-	if err := d.SetNew("version", c.Metadata.Version); err != nil {
-		return err
+
+	// Set desired version from the Chart metadata if available
+	if len(c.Metadata.Version) > 0 {
+		if err := d.SetNew("version", c.Metadata.Version); err != nil {
+			return err
+		}
+	} else {
+		if err := d.SetNewComputed("version"); err != nil {
+			return err
+		}
 	}
 
 	// Merge all "values", "set", "set_string" and assign the result to "overrides"
@@ -500,20 +495,15 @@ func resourceReleaseExists(d *schema.ResourceData, meta interface{}) (bool, erro
 }
 
 func resourceReleaseImportState(d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
-	re, err := regexp.Compile("(?P<repository>.+)\\.(?P<name>.+)")
-
-	if err != nil {
-		return nil, fmt.Errorf("Import is not supported. Invalid regex formats.")
+	var parts = strings.SplitN(d.Id(), ".", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid id format: %s", d.Id())
 	}
 
-	if fieldValues := re.FindStringSubmatch(d.Id()); fieldValues != nil {
-		for i := 1; i < len(fieldValues); i++ {
-			fieldName := re.SubexpNames()[i]
-			d.Set(fieldName, fieldValues[i])
-		}
-	}
-
-	name := d.Get("name").(string)
+	var repository = parts[0]
+	var name = parts[1]
+	d.Set("repository", repository)
+	d.Set("name", name)
 
 	m := meta.(*Meta)
 	c, err := m.GetHelmClient()
@@ -526,14 +516,13 @@ func resourceReleaseImportState(d *schema.ResourceData, meta interface{}) ([]*sc
 		return nil, err
 	}
 
-	d.Set("chart", r.Chart.Metadata.Name)
+	d.Set("chart", fmt.Sprintf("%s/%s", repository, r.Chart.Metadata.Name))
 	setIDAndMetadataFromRelease(d, r)
 
 	return []*schema.ResourceData{d}, nil
 }
 
 func deleteRelease(c helm.Interface, name string, disableWebhooks bool, timeout int64) error {
-
 	opts := []helm.DeleteOption{
 		helm.DeleteDisableHooks(disableWebhooks),
 		helm.DeletePurge(true),
@@ -673,7 +662,18 @@ func getValues(d resourceGetter) ([]byte, error) {
 		}
 	}
 
-	return yaml.Marshal(base)
+	yaml, err := yaml.Marshal(base)
+	if err == nil {
+		yamlString := string(yaml)
+		for _, raw := range d.Get("set_sensitive").(*schema.Set).List() {
+			set := raw.(map[string]interface{})
+			yamlString = strings.Replace(yamlString, set["value"].(string), "<SENSITIVE>", -1)
+		}
+
+		log.Printf("---[ values.yaml ]-----------------------------------\n%s\n", yamlString)
+	}
+
+	return yaml, err
 }
 
 var all = []release.Status_Code{

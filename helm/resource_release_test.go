@@ -16,184 +16,231 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/terraform/helper/resource"
-	"github.com/hashicorp/terraform/terraform"
-	"gopkg.in/yaml.v1"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/acctest"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/terraform"
+	yaml "gopkg.in/yaml.v1"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/helm/pkg/helm"
+	"k8s.io/helm/pkg/repo"
 )
 
 func TestAccResourceRelease_basic(t *testing.T) {
-	resource.Test(t, resource.TestCase{
+	name := fmt.Sprintf("test-basic-%s", acctest.RandString(10))
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
 		Providers:    testAccProviders,
-		CheckDestroy: testAccCheckHelmReleaseDestroy,
-		Steps: []resource.TestStep{
-			resource.TestStep{
-				Config: testAccHelmReleaseConfigBasic(testResourceName, testNamespace, "test-basic", "0.6.2"),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.name", "test-basic"),
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.namespace", testNamespace),
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
-					resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.chart", "mariadb"),
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "0.6.2"),
-				),
-			},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-			resource.TestStep{
-				Config: testAccHelmReleaseConfigBasic(testResourceName, testNamespace, "test-basic", "0.6.2"),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "0.6.2"),
-					resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
-				),
-			},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-		},
+		CheckDestroy: testAccCheckHelmReleaseDestroy(namespace),
+		Steps: []resource.TestStep{{
+			Config:       testAccHelmReleaseConfigBasic(testResourceName, namespace, name, "0.6.2"),
+			ResourceName: "helm_release.test",
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.name", name),
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.namespace", namespace),
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
+				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.chart", "mariadb"),
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "0.6.2"),
+			),
+		}, {
+			Config:            testAccHelmReleaseConfigBasic(testResourceName, namespace, name, "0.6.2"),
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ResourceName:      "helm_release.test",
+			ImportState:       true,
+			ImportStateVerify: true,
+		}, {
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "0.6.2"),
+				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
+			),
+		}, {
+			ResourceName:      "helm_release.test",
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}},
 	})
 }
 
 func TestAccResourceRelease_concurrent(t *testing.T) {
 	var wg sync.WaitGroup
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
+
+	// This test case cannot be parallelized by using `resource.ParallelTest()` as calling `t.Parallel()` more than
+	// once in a single test case resuls in the following error:
+	// `panic: testing: t.Parallel called multiple times`
+	t.Parallel()
 
 	wg.Add(3)
 	for i := 0; i < 3; i++ {
 		go func(name string) {
 			defer wg.Done()
 			resource.Test(t, resource.TestCase{
+				PreCheck:     func() { testAccPreCheck(t) },
 				Providers:    testAccProviders,
-				CheckDestroy: testAccCheckHelmReleaseDestroy,
-				Steps: []resource.TestStep{
-					resource.TestStep{
-						Config: testAccHelmReleaseConfigBasic(name, testNamespace, name, "0.6.2"),
-						Check: resource.ComposeAggregateTestCheckFunc(
-							resource.TestCheckResourceAttr(
-								fmt.Sprintf("helm_release.%s", name), "metadata.0.name", name,
-							),
+				CheckDestroy: testAccCheckHelmReleaseDestroy(namespace),
+				Steps: []resource.TestStep{{
+					Config:       testAccHelmReleaseConfigBasic(name, namespace, name, "0.6.2"),
+					ResourceName: fmt.Sprintf("helm_release.%s", name),
+					Check: resource.ComposeAggregateTestCheckFunc(
+						resource.TestCheckResourceAttr(
+							fmt.Sprintf("helm_release.%s", name), "metadata.0.name", name,
 						),
-					},
-					resource.TestStep{
-						ResourceName:      fmt.Sprintf("helm_release.%s", name),
-						ImportState:       true,
-						ImportStateVerify: true,
-					},
-				},
+					),
+				}, {
+					Config:            testAccHelmReleaseConfigBasic(name, namespace, name, "0.6.2"),
+					ResourceName:      fmt.Sprintf("helm_release.%s", name),
+					ImportStateId:     fmt.Sprintf("stable.%s", name),
+					ImportState:       true,
+					ImportStateVerify: true,
+				}},
 			})
-		}(fmt.Sprintf("concurrent-%d", i))
+		}(fmt.Sprintf("concurrent-%d-%s", i, acctest.RandString(10)))
 	}
 
 	wg.Wait()
 }
 
 func TestAccResourceRelease_update(t *testing.T) {
-	resource.Test(t, resource.TestCase{
+	name := fmt.Sprintf("test-update-%s", acctest.RandString(10))
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
 		Providers:    testAccProviders,
-		CheckDestroy: testAccCheckHelmReleaseDestroy,
+		CheckDestroy: testAccCheckHelmReleaseDestroy(namespace),
 		Steps: []resource.TestStep{{
-			Config: testAccHelmReleaseConfigBasic(testResourceName, testNamespace, "test-update", "0.6.2"),
+			Config:       testAccHelmReleaseConfigBasic(testResourceName, namespace, name, "0.6.2"),
+			ResourceName: "helm_release.test",
 			Check: resource.ComposeAggregateTestCheckFunc(
 				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
 				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "0.6.2"),
 				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
 			),
-		},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-			{
-				Config: testAccHelmReleaseConfigBasic(testResourceName, testNamespace, "test-update", "0.6.3"),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "2"),
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "0.6.3"),
-					resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
-				),
-			},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-		},
+		}, {
+			Config:            testAccHelmReleaseConfigBasic(testResourceName, namespace, name, "0.6.3"),
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ResourceName:      "helm_release.test",
+			ImportState:       true,
+			ImportStateVerify: true,
+		}, {
+			ResourceName: "helm_release.test",
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "2"),
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "0.6.3"),
+				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
+			),
+		}, {
+			ResourceName:      "helm_release.test",
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}},
 	})
 }
 
 func TestAccResourceRelease_emptyValuesList(t *testing.T) {
-	resource.Test(t, resource.TestCase{
+	name := fmt.Sprintf("test-empty-values-list-%s", acctest.RandString(10))
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
 		Providers:    testAccProviders,
-		CheckDestroy: testAccCheckHelmReleaseDestroy,
+		CheckDestroy: testAccCheckHelmReleaseDestroy(namespace),
 		Steps: []resource.TestStep{{
+			ResourceName: "helm_release.test",
 			Config: testAccHelmReleaseConfigValues(
-				testResourceName, testNamespace, "test-empty-values-list", "stable/kibana", []string{""},
+				testResourceName, namespace, name, "stable/kibana", []string{""},
 			),
 			Check: resource.ComposeAggregateTestCheckFunc(
 				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
 				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
 				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.values", "{}\n"),
 			),
-		},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-		},
+		}, {
+			ResourceName: "helm_release.test",
+			Config: testAccHelmReleaseConfigValues(
+				testResourceName, namespace, name, "stable/kibana", []string{""},
+			),
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}},
 	})
 }
 
 func TestAccResourceRelease_updateValues(t *testing.T) {
-	resource.Test(t, resource.TestCase{
+	name := fmt.Sprintf("test-update-values-%s", acctest.RandString(10))
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
 		Providers:    testAccProviders,
-		CheckDestroy: testAccCheckHelmReleaseDestroy,
+		CheckDestroy: testAccCheckHelmReleaseDestroy(namespace),
 		Steps: []resource.TestStep{{
+			ResourceName: "helm_release.test",
 			Config: testAccHelmReleaseConfigValues(
-				testResourceName, testNamespace, "test-update-values", "stable/kibana", []string{"foo: bar"},
+				testResourceName, namespace, name, "stable/kibana", []string{"foo: bar"},
 			),
 			Check: resource.ComposeAggregateTestCheckFunc(
 				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
 				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
 				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.values", "foo: bar\n"),
 			),
-		},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-			{
-				Config: testAccHelmReleaseConfigValues(
-					testResourceName, testNamespace, "test-update-values", []string{"foo: baz"},
-				),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "2"),
-					resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.values", "foo: baz\n"),
-				),
-			},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-		},
+		}, {
+			ResourceName: "helm_release.test",
+			Config: testAccHelmReleaseConfigValues(
+				testResourceName, namespace, name, "stable/kibana", []string{"foo: bar"},
+			),
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}, {
+			ResourceName: "helm_release.test",
+			Config: testAccHelmReleaseConfigValues(
+				testResourceName, namespace, name, "stable/kibana", []string{"foo: baz"},
+			),
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "2"),
+				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.values", "foo: baz\n"),
+			),
+		}, {
+			ResourceName:      "helm_release.test",
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}},
 	})
 }
 
 func TestAccResourceRelease_updateMultipleValues(t *testing.T) {
-	resource.Test(t, resource.TestCase{
+	name := fmt.Sprintf("test-update-multiple-values-%s", acctest.RandString(10))
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
 		Providers:    testAccProviders,
-		CheckDestroy: testAccCheckHelmReleaseDestroy,
+		CheckDestroy: testAccCheckHelmReleaseDestroy(namespace),
 		Steps: []resource.TestStep{{
+			ResourceName: "helm_release.test",
 			Config: testAccHelmReleaseConfigValues(
-				testResourceName, testNamespace, "test-update-multiple-values",
+				testResourceName, namespace, name,
 				"stable/kibana", []string{"foo: bar"},
 			),
 			Check: resource.ComposeAggregateTestCheckFunc(
@@ -201,102 +248,179 @@ func TestAccResourceRelease_updateMultipleValues(t *testing.T) {
 				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
 				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.values", "foo: bar\n"),
 			),
-		},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-			{
-				Config: testAccHelmReleaseConfigValues(
-					testResourceName, testNamespace, "test-update-multiple-values",
-					[]string{"foo: bar", "foo: baz"},
-				),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "2"),
-					resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.values", "foo: baz\n"),
-				),
-			},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-		},
+		}, {
+			ResourceName: "helm_release.test",
+			Config: testAccHelmReleaseConfigValues(
+				testResourceName, namespace, name,
+				"stable/kibana", []string{"foo: bar"},
+			),
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}, {
+			ResourceName: "helm_release.test",
+			Config: testAccHelmReleaseConfigValues(
+				testResourceName, namespace, name,
+				"stable/kibana", []string{"foo: bar", "foo: baz"},
+			),
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "2"),
+				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.values", "foo: baz\n"),
+			),
+		}, {
+			ResourceName:      "helm_release.test",
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}},
 	})
 }
 
 func TestAccResourceRelease_repository(t *testing.T) {
+	name := fmt.Sprintf("test-repository-%s", acctest.RandString(10))
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
 
-	resource.Test(t, resource.TestCase{
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:  func() { testAccPreCheck(t) },
 		Providers: testAccProviders,
 		Steps: []resource.TestStep{{
-			Config: testAccHelmReleaseConfigRepository(testNamespace, testResourceName),
+			Config:       testAccHelmReleaseConfigRepository(testResourceName, namespace, name),
+			ResourceName: "helm_release.test",
 			Check: resource.ComposeAggregateTestCheckFunc(
 				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
 				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
 				resource.TestCheckResourceAttrSet("helm_release.test", "metadata.0.version"),
 			),
-  		},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-			{
-				Config: testAccHelmReleaseConfigRepository(testNamespace, testResourceName),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
-					resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
-					resource.TestCheckResourceAttrSet("helm_release.test", "metadata.0.version"),
-				),
-			},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
+		}, {
+			ResourceName:      "helm_release.test",
+			Config:            testAccHelmReleaseConfigRepository(testResourceName, namespace, name),
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}, {
+			Config:       testAccHelmReleaseConfigRepository(testResourceName, namespace, name),
+			ResourceName: "helm_release.test",
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
+				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
+				resource.TestCheckResourceAttrSet("helm_release.test", "metadata.0.version"),
+			),
+		}, {
+			ResourceName:      "helm_release.test",
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}},
+	})
+}
+
+func TestAccResourceRelease_repositoryDatasource(t *testing.T) {
+	name := fmt.Sprintf("test-repository-%s", acctest.RandString(10))
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
+
+	resource.ParallelTest(t, resource.TestCase{
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{{
+			Config:       testAccHelmReleaseConfigRepositoryDatasource(testResourceName, namespace, name),
+			ResourceName: "helm_release.test",
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
+				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
+				resource.TestCheckResourceAttrSet("helm_release.test", "metadata.0.version"),
+			),
+		}, {
+			Config:       testAccHelmReleaseConfigRepositoryDatasource(testResourceName, namespace, name),
+			ResourceName: "helm_release.test",
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
+				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
+				resource.TestCheckResourceAttrSet("helm_release.test", "metadata.0.version"),
+			),
+		}},
+	})
+}
+
+func TestAccResourceRelease_repositoryMultipleDatasources(t *testing.T) {
+	name := fmt.Sprintf("test-repository-%s", acctest.RandString(10))
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
+
+	repo1 := "test-acc-repo-1"
+	repo2 := "test-acc-repo-2"
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+			testAccPreCheckHelmRepositoryDestroy(t, repo1)
+			testAccPreCheckHelmRepositoryDestroy(t, repo2)
 		},
+		Providers: testAccProviders,
+		Steps: []resource.TestStep{{
+			Config:       testAccHelmReleaseConfigRepositoryMultipleDatasource(repo1, repo2, testResourceName, namespace, name),
+			ResourceName: "helm_release.test",
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
+				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
+				resource.TestCheckResourceAttrSet("helm_release.test", "metadata.0.version"),
+			),
+		}},
 	})
 }
 
 func TestAccResourceRelease_repository_url(t *testing.T) {
-	resource.Test(t, resource.TestCase{
+	name := fmt.Sprintf("test-repository-url-%s", acctest.RandString(10))
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:  func() { testAccPreCheck(t) },
 		Providers: testAccProviders,
 		Steps: []resource.TestStep{{
-			Config: testAccHelmReleaseConfigRepositoryURL(testNamespace, testResourceName),
+			Config:       testAccHelmReleaseConfigRepositoryURL(testResourceName, namespace, name),
+			ResourceName: "helm_release.test",
 			Check: resource.ComposeAggregateTestCheckFunc(
 				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
 				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
 				resource.TestCheckResourceAttrSet("helm_release.test", "metadata.0.version"),
 				resource.TestCheckResourceAttrSet("helm_release.test", "version"),
 			),
-		},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-			{
-				Config: testAccHelmReleaseConfigRepositoryURL(testNamespace, testResourceName),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
-					resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
-					resource.TestCheckResourceAttrSet("helm_release.test", "metadata.0.version"),
-					resource.TestCheckResourceAttrSet("helm_release.test", "version"),
-				),
-			},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-		},
+		}, {
+			ResourceName:      "helm_release.test",
+			Config:            testAccHelmReleaseConfigRepositoryURL(testResourceName, namespace, name),
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}, {
+			ResourceName: "helm_release.test",
+			Config:       testAccHelmReleaseConfigRepositoryURL(testResourceName, namespace, name),
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
+				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
+				resource.TestCheckResourceAttrSet("helm_release.test", "metadata.0.version"),
+				resource.TestCheckResourceAttrSet("helm_release.test", "version"),
+			),
+		}, {
+			ResourceName:      "helm_release.test",
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}},
 	})
 }
 
 func TestAccResourceRelease_updateAfterFail(t *testing.T) {
+	name := fmt.Sprintf("test-update-after-fail-%s", acctest.RandString(10))
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
+
 	malformed := `
 	resource "helm_release" "test" {
 		name        = "malformed"
@@ -308,43 +432,52 @@ func TestAccResourceRelease_updateAfterFail(t *testing.T) {
 	}
 	`
 
-	resource.Test(t, resource.TestCase{
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
 		Providers:    testAccProviders,
-		CheckDestroy: testAccCheckHelmReleaseDestroy,
+		CheckDestroy: testAccCheckHelmReleaseDestroy(namespace),
 		Steps: []resource.TestStep{{
+			ResourceName:       "helm_release.test",
 			Config:             malformed,
 			ExpectError:        regexp.MustCompile("failed"),
 			ExpectNonEmptyPlan: true,
-		},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-			{
-				Config: testAccHelmReleaseConfigBasic(testResourceName, testNamespace, testResourceName, "0.6.3"),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "0.6.3"),
-					resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
-				),
-			},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-		},
+		}, {
+			ResourceName:      "helm_release.test",
+			Config:            malformed,
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}, {
+			Config:       testAccHelmReleaseConfigBasic(testResourceName, namespace, name, "0.6.3"),
+			ResourceName: "helm_release.test",
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "0.6.3"),
+				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
+			),
+		}, {
+			ResourceName:      "helm_release.test",
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}},
 	})
 }
 
 func TestAccResourceRelease_updateExistingFailed(t *testing.T) {
-	resource.Test(t, resource.TestCase{
+	name := fmt.Sprintf("test-update-existing-failed-%s", acctest.RandString(10))
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
+
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
 		Providers:    testAccProviders,
-		CheckDestroy: testAccCheckHelmReleaseDestroy,
+		CheckDestroy: testAccCheckHelmReleaseDestroy(namespace),
 		Steps: []resource.TestStep{{
+			ResourceName: "helm_release.test",
 			Config: testAccHelmReleaseConfigValues(
-				testResourceName, testNamespace, testResourceName, "stable/mariadb",
+				testResourceName, namespace, name, "stable/mariadb",
 				[]string{"master:\n  persistence:\n    enabled: false", "replication:\n  enabled: false"},
 			),
 			Check: resource.ComposeAggregateTestCheckFunc(
@@ -352,8 +485,9 @@ func TestAccResourceRelease_updateExistingFailed(t *testing.T) {
 				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
 			),
 		}, {
+			ResourceName: "helm_release.test",
 			Config: testAccHelmReleaseConfigValues(
-				testResourceName, testNamespace, testResourceName, "stable/mariadb",
+				testResourceName, namespace, name, "stable/mariadb",
 				[]string{"master:\n  persistence:\n    enabled: true", "replication:\n  enabled: false"},
 			),
 			ExpectError:        regexp.MustCompile("forbidden"),
@@ -363,8 +497,9 @@ func TestAccResourceRelease_updateExistingFailed(t *testing.T) {
 				resource.TestCheckResourceAttr("helm_release.test", "status", "FAILED"),
 			),
 		}, {
+			ResourceName: "helm_release.test",
 			Config: testAccHelmReleaseConfigValues(
-				testResourceName, testNamespace, testResourceName, "stable/mariadb",
+				testResourceName, namespace, name, "stable/mariadb",
 				[]string{"master:\n  persistence:\n    enabled: true", "replication:\n  enabled: false"},
 			),
 			ExpectError:        regexp.MustCompile("forbidden"),
@@ -374,15 +509,21 @@ func TestAccResourceRelease_updateExistingFailed(t *testing.T) {
 }
 
 func TestAccResourceRelease_updateVersionFromRelease(t *testing.T) {
+	name := fmt.Sprintf("test-update-version-from-release-%s", acctest.RandString(10))
+	namespace := fmt.Sprintf("%s-%s", testNamespace, acctest.RandString(10))
+	// Delete namespace automatically created by helm after checks
+	defer deleteNamespace(t, namespace)
+
 	dir, err := ioutil.TempDir("", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	chartPath := filepath.Join(dir, "mariadb")
 	defer os.RemoveAll(dir)
-	resource.Test(t, resource.TestCase{
+	resource.ParallelTest(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
 		Providers:    testAccProviders,
-		CheckDestroy: testAccCheckHelmReleaseDestroy,
+		CheckDestroy: testAccCheckHelmReleaseDestroy(namespace),
 		Steps: []resource.TestStep{{
 			PreConfig: func() {
 				err := downloadTar("https://kubernetes-charts.storage.googleapis.com/mariadb-0.6.2.tgz", dir)
@@ -390,8 +531,9 @@ func TestAccResourceRelease_updateVersionFromRelease(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
+			ResourceName: "helm_release.test",
 			Config: fmt.Sprintf(`
-			resource "helm_release" "test" {
+			resource "helm_release" %q {
 				name      = %q
 				namespace = %q
 				chart     = %q
@@ -400,50 +542,49 @@ func TestAccResourceRelease_updateVersionFromRelease(t *testing.T) {
 					value = "false" # persistent volumes are giving non-related issues when testing
 				}
 			}
-		`, testNamespace, testResourceName, chartPath),
+		`, testResourceName, name, namespace, chartPath),
 			Check: resource.ComposeAggregateTestCheckFunc(
 				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "1"),
 				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "0.6.2"),
 				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
 				resource.TestCheckResourceAttr("helm_release.test", "version", "0.6.2"),
 			),
-		},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-			{
-				PreConfig: func() {
-					err := downloadTar("https://kubernetes-charts.storage.googleapis.com/mariadb-0.6.3.tgz", dir)
-					if err != nil {
-						t.Fatal(err)
-					}
-				},
-				Config: fmt.Sprintf(`
-				resource "helm_release" "test" {
-					name      = %q
-					namespace = %q
-					chart     = %q
-					set {
-						name = "persistence.enabled"
-						value = "false" # persistent volumes are giving non-related issues when testing
-					}
+		}, {
+			ResourceName:      "helm_release.test",
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}, {
+			PreConfig: func() {
+				err := downloadTar("https://kubernetes-charts.storage.googleapis.com/mariadb-0.6.3.tgz", dir)
+				if err != nil {
+					t.Fatal(err)
 				}
-			`, testNamespace, testResourceName, chartPath),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "2"),
-					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "0.6.3"),
-					resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
-					resource.TestCheckResourceAttr("helm_release.test", "version", "0.6.3"),
-				),
 			},
-			resource.TestStep{
-				ResourceName:      "helm_release.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-		},
+			ResourceName: "helm_release.test",
+			Config: fmt.Sprintf(`
+			resource "helm_release" %q {
+				name      = %q
+				namespace = %q
+				chart     = %q
+				set {
+					name = "persistence.enabled"
+					value = "false" # persistent volumes are giving non-related issues when testing
+				}
+			}
+			`, testResourceName, name, namespace, chartPath),
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.revision", "2"),
+				resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "0.6.3"),
+				resource.TestCheckResourceAttr("helm_release.test", "status", "DEPLOYED"),
+				resource.TestCheckResourceAttr("helm_release.test", "version", "0.6.3"),
+			),
+		}, {
+			ResourceName:      "helm_release.test",
+			ImportStateId:     fmt.Sprintf("stable.%s", name),
+			ImportState:       true,
+			ImportStateVerify: true,
+		}},
 	})
 }
 
@@ -521,82 +662,144 @@ func TestGetValues(t *testing.T) {
 	}
 }
 
-func testAccHelmReleaseConfigRepository(ns, name string) string {
+func testAccHelmReleaseConfigRepository(resource, ns, name string) string {
 	return fmt.Sprintf(`
 		resource "helm_repository" "stable_repo" {
 			name = "stable-repo"
 			url  = "https://kubernetes-charts.storage.googleapis.com"
 		}
 
-		resource "helm_release" "test" {
+		resource "helm_release" %q {
 			name       = %q
 			namespace  = %q
 			repository = "${helm_repository.stable_repo.metadata.0.name}"
 			chart      = "coredns"
 		}
-	`, name, ns)
+	`, resource, name, ns)
 }
 
-func testAccHelmReleaseConfigRepositoryURL(ns, name string) string {
+func testAccHelmReleaseConfigRepositoryDatasource(resource, ns, name string) string {
 	return fmt.Sprintf(`
-		resource "helm_release" "test" {
+		data "helm_repository" "stable_repo" {
+			name = "stable-repo"
+			url  = "https://kubernetes-charts.storage.googleapis.com"
+		}
+
+		resource "helm_release" %q {
+			name       = %q
+			namespace  = %q
+			repository = "${data.helm_repository.stable_repo.metadata.0.name}"
+			chart      = "coredns"
+		}
+	`, resource, name, ns)
+}
+
+func testAccHelmReleaseConfigRepositoryMultipleDatasource(repo1, repo2, resource, ns, name string) string {
+	return fmt.Sprintf(`
+		data "helm_repository" "stable_repo" {
+			name = %q
+			url  = "https://kubernetes-charts.storage.googleapis.com"
+		}
+
+		data "helm_repository" "stable_repo_2" {
+			name = %q
+			url  = "https://kubernetes-charts.storage.googleapis.com"
+		}
+
+		resource "helm_release" %q {
+			name       = %q
+			namespace  = %q
+			repository = "${data.helm_repository.stable_repo.metadata.0.name}"
+			chart      = "coredns"
+		}
+
+		resource "helm_release" %q {
+			name       = %q
+			namespace  = %q
+			repository = "${data.helm_repository.stable_repo_2.metadata.0.name}"
+			chart      = "coredns"
+		}
+	`, repo1, repo2, resource, name, ns, resource+"_2", name+"-2", ns)
+}
+
+func testAccHelmReleaseConfigRepositoryURL(resource, ns, name string) string {
+	return fmt.Sprintf(`
+		resource "helm_release" %q {
 			name       = %q
 			namespace  = %q
 			repository = "https://kubernetes-charts.storage.googleapis.com"
 			chart      = "coredns"
 		}
-	`, name, ns)
+	`, resource, name, ns)
 }
 
-func testAccCheckHelmReleaseDestroy(s *terraform.State) error {
-	// Fix for a flaky test
-	// Helm doesn't instantly delete it's releases causing this test to fail if not waited for a small period of time.
-	// TODO: improve the workaround
-	time.Sleep(30 * time.Second)
+func testAccPreCheckHelmRepositoryDestroy(t *testing.T, name string) {
+	settings := testAccProvider.Meta().(*Meta).Settings
 
-	m := testAccProvider.Meta()
-	if m == nil {
-		return fmt.Errorf("provider not properly initialized")
-	}
-
-	client, err := m.(*Meta).GetHelmClient()
+	repoFile := settings.Home.RepositoryFile()
+	r, err := repo.LoadRepositoriesFile(repoFile)
 	if err != nil {
-		return err
+		t.Fatal(err)
+	}
+	if !r.Remove(name) {
+		t.Log(fmt.Sprintf("no repo named %q found, nothing to do", name))
+		return
+	}
+	if err := r.WriteFile(repoFile, 0644); err != nil {
+		t.Fatalf("Failed to write repositories file: %s", err)
 	}
 
-	res, err := client.ListReleases(
-		helm.ReleaseListNamespace(testNamespace),
-	)
+	if _, err := os.Stat(settings.Home.CacheIndex(name)); err == nil {
+		err = os.Remove(settings.Home.CacheIndex(name))
+		if err != nil {
+			t.Fatalf("Failed to remove repository cache: %s", err)
+		}
+	}
 
-	if res == nil {
+	t.Log(fmt.Sprintf("%q has been removed from your repositories\n", name))
+}
+
+func testAccCheckHelmReleaseDestroy(namespace string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		// Fix for a flaky test
+		// Helm doesn't instantly delete its releases causing this test to fail if not waited for a small period of time.
+		// TODO: improve the workaround
+		time.Sleep(30 * time.Second)
+
+		m := testAccProvider.Meta()
+		if m == nil {
+			return fmt.Errorf("provider not properly initialized")
+		}
+
+		client, err := m.(*Meta).GetHelmClient()
+		if err != nil {
+			return err
+		}
+
+		res, err := client.ListReleases(
+			helm.ReleaseListNamespace(namespace),
+		)
+
+		if res == nil {
+			return nil
+		}
+
+		if err != nil {
+			return err
+		}
+
+		for _, r := range res.Releases {
+			if r.Name == testResourceName {
+				return fmt.Errorf("found %q release", testResourceName)
+			}
+		}
+
+		if res.Count != 0 {
+			return fmt.Errorf("%q namespace should be empty", namespace)
+		}
+
 		return nil
 	}
-
-	if err != nil {
-		return err
-	}
-
-	for _, r := range res.Releases {
-		if r.Name == testResourceName {
-			return fmt.Errorf("found %q release", testResourceName)
-		}
-	}
-
-	if res.Count != 0 {
-		return fmt.Errorf("%q namespace should be empty", testNamespace)
-	}
-
-	return nil
-}
-
-func testAccHelmReleaseConfigLocalDir(ns, name, path string) string {
-	return fmt.Sprintf(`
-		resource "helm_release" "test" {
-			name      = %q
-			namespace = %q
-			chart     = %q
-		}
-	`, name, ns, path)
 }
 
 func downloadTar(url, dst string) error {
@@ -643,5 +846,27 @@ func unTar(dst string, r io.Reader) error {
 				return err
 			}
 		}
+	}
+}
+
+func deleteNamespace(t *testing.T, namespace string) {
+	// Nothing to cleanup with unit test
+	if os.Getenv("TF_ACC") == "" {
+		return
+	}
+
+	m := testAccProvider.Meta()
+	if m == nil {
+		t.Fatal("provider not properly initialized")
+	}
+
+	debug("[DEBUG] Deleting namespace %q", namespace)
+	gracePeriodSeconds := int64(0)
+	deleteOptions := meta_v1.DeleteOptions{
+		GracePeriodSeconds: &gracePeriodSeconds,
+	}
+	err := m.(*Meta).K8sClient.CoreV1().Namespaces().Delete(namespace, &deleteOptions)
+	if err != nil {
+		t.Fatalf("An error occurred while deleting namespace %q: %q", namespace, err)
 	}
 }
